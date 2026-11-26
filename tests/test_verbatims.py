@@ -19,7 +19,7 @@ def _frame():
 
 
 def test_loader_trail_counts_and_channel_map():
-    comments, trail = load.load_verbatims(_frame(), business="GEMS")
+    comments, trail = load.load_verbatims(_frame(), business="A")
     steps = dict((s, (n, r)) for s, n, r in trail)
     assert steps["rows read"] == (6, 0)
     assert steps["no NPS score"] == (5, 1)
