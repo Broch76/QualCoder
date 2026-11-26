@@ -161,13 +161,17 @@ def test_api_batch_path_with_fake_client(tmp_path):
             return types.SimpleNamespace(id=bid, processing_status="ended")
         def results(self, bid):
             for r in self.reqs:
-                s = int(r["custom_id"].split("-")[1])
-                items = [{"i": s + j, "codes": ["claims"] if s + j == 0 else [], "other_label": ""} for j in range(2)]
+                text = r["params"]["messages"][0]["content"]
+                if not isinstance(text, str):
+                    text = text[0]["text"]
+                idx = [int(l.split(":")[0]) for l in text.splitlines()[1:]]
+                items = [{"i": i, "codes": ["claims"] if i == 0 else [], "other_label": ""} for i in idx]
                 yield types.SimpleNamespace(custom_id=r["custom_id"],
                                             result=types.SimpleNamespace(type="succeeded", message=msg({"items": items})))
 
     c = llm.Claude.__new__(llm.Claude)
     c.mode, c.dir, c.poll, c.log = "api", str(tmp_path), 0, []
+    c.models = {}
     c.client = types.SimpleNamespace(messages=types.SimpleNamespace(batches=Batches(), create=None))
     old = llm.BATCH
     try:

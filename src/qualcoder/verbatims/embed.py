@@ -56,9 +56,20 @@ class LexicalEmbedder:
         from scipy.sparse.linalg import svds
         X = self._matrix(texts, fit=True)
         k = max(2, min(self.dim, min(X.shape) - 1))
-        rng = np.random.default_rng(self.seed)
-        v0 = rng.standard_normal(min(X.shape))
-        _, s, vt = svds(X, k=k, v0=v0)
+        if X.shape[1] <= 6000:
+            # Small vocabulary: exact SVD via the vocab x vocab Gram matrix. ARPACK is not reproducible when k is
+            # close to the rank (the near-degenerate tail rotates between runs), which changed topics run to run.
+            G = np.asarray((X.T @ X).todense())
+            w, V = np.linalg.eigh(G)
+            order = np.argsort(-w)[:k]
+            s, vt = np.sqrt(np.clip(w[order], 0, None)), V[:, order].T
+        else:
+            rng = np.random.default_rng(self.seed)
+            v0 = rng.standard_normal(min(X.shape))
+            try:
+                _, s, vt = svds(X, k=k, v0=v0, rng=np.random.default_rng(self.seed))
+            except TypeError:                  # older scipy: random_state
+                _, s, vt = svds(X, k=k, v0=v0, random_state=self.seed)
         order = np.argsort(-s)
         vt = vt[order]
         signs = np.sign(vt[np.arange(len(vt)), np.abs(vt).argmax(1)])

@@ -40,10 +40,12 @@ def chi2_p(stat):
         return float(math.erfc(math.sqrt(max(stat, 0) / 2)))
 
 
-def mantel_haenszel(y, e, strata):
-    """y, e: 0/1 arrays (theme present, exposed); strata: labels. Returns (OR_MH, chi2, p)."""
+def mantel_haenszel(y, e, strata, ci=False):
+    """y, e: 0/1 arrays (theme present, exposed); strata: labels. Returns (OR_MH, chi2, p), or with ci=True
+    (OR_MH, chi2, p, lo, hi) using the Robins-Breslow-Greenland variance of log OR_MH."""
     y, e, strata = np.asarray(y), np.asarray(e), np.asarray(strata)
     num = den = a_sum = ea_sum = var = 0.0
+    sP = sQ = sR = sS = 0.0  # RBG sums: P*R, P*S + Q*R, Q*S, with R = ad/n, S = bc/n
     for s in np.unique(strata):
         m = strata == s
         a = float(((y == 1) & (e == 1) & m).sum()); b = float(((y == 0) & (e == 1) & m).sum())
@@ -52,14 +54,23 @@ def mantel_haenszel(y, e, strata):
         if n < 2 or (a + b) == 0 or (c + d) == 0:
             continue
         num += a * d / n; den += b * c / n
+        P, Q, R, S = (a + d) / n, (b + c) / n, a * d / n, b * c / n
+        sP += P * R; sQ += P * S + Q * R; sR += Q * S
         r1, c1 = a + b, a + c
         a_sum += a; ea_sum += r1 * c1 / n
         var += r1 * (c + d) * c1 * (b + d) / (n * n * (n - 1))
     if var == 0:
-        return float("nan"), 0.0, 1.0
+        return (float("nan"), 0.0, 1.0) + ((float("nan"), float("nan")) if ci else ())
     stat = (abs(a_sum - ea_sum)) ** 2 / var
     orr = num / den if den > 0 else float("inf")
-    return orr, stat, chi2_p(stat)
+    if not ci:
+        return orr, stat, chi2_p(stat)
+    if num > 0 and den > 0:
+        v = sP / (2 * num ** 2) + sQ / (2 * num * den) + sR / (2 * den ** 2)
+        lo, hi = math.exp(math.log(orr) - 1.96 * math.sqrt(v)), math.exp(math.log(orr) + 1.96 * math.sqrt(v))
+    else:
+        lo, hi = float("nan"), float("nan")
+    return orr, stat, chi2_p(stat), lo, hi
 
 
 def two_prop(x1, n1, x2, n2):
@@ -70,8 +81,21 @@ def two_prop(x1, n1, x2, n2):
     if p in (0, 1):
         return float("nan"), 1.0
     stat = (x1 / n1 - x2 / n2) ** 2 / (p * (1 - p) * (1 / n1 + 1 / n2))
-    a, b, c, d = x1 + .5, n1 - x1 + .5, x2 + .5, n2 - x2 + .5
+    a, b, c, d = x1, n1 - x1, x2, n2 - x2
+    if min(a, b, c, d) == 0:            # Haldane correction only when a cell is empty
+        a, b, c, d = a + .5, b + .5, c + .5, d + .5
     return (a * d) / (b * c), chi2_p(stat)
+
+
+def or_ci(x1, n1, x2, n2):
+    """Woolf 95% interval for the unadjusted odds ratio (Haldane-corrected if a cell is empty)."""
+    a, b, c, d = x1, n1 - x1, x2, n2 - x2
+    if min(n1, n2) == 0:
+        return float("nan"), float("nan")
+    if min(a, b, c, d) == 0:
+        a, b, c, d = a + .5, b + .5, c + .5, d + .5
+    lo = math.log(a * d / (b * c)); se = math.sqrt(1 / a + 1 / b + 1 / c + 1 / d)
+    return math.exp(lo - 1.96 * se), math.exp(lo + 1.96 * se)
 
 
 def bh(pvals):
@@ -108,7 +132,8 @@ def prevalence(comments, themes, by=("business",), group="detractor"):
 
 
 def effects(comments, themes, group="detractor"):
-    """Business, channel and business x channel effects for every theme, BH-adjusted together."""
+    """Business, channel and business x channel effects for every theme. Benjamini-Hochberg is applied across
+    all rows of this table (one code set); tables from different code sets are corrected separately."""
     idx = [i for i, c in enumerate(comments) if c["group"] == group]
     C = [comments[i] for i in idx]; T = [themes[i] for i in idx]
     bus = np.array([c["business"] for c in C]); ch = np.array([c["channel"] for c in C])
@@ -119,20 +144,20 @@ def effects(comments, themes, group="detractor"):
             e = (bus == b).astype(int)
             n1, n2 = int(e.sum()), int((1 - e).sum()); x1, x2 = int(y[e == 1].sum()), int(y[e == 0].sum())
             or_raw, p_raw = two_prop(x1, n1, x2, n2)
-            or_mh, _, p_mh = mantel_haenszel(y, e, ch)
+            or_mh, _, p_mh, lo, hi = mantel_haenszel(y, e, ch, ci=True)
             rows.append(dict(kind="business", theme=t, group_a=b, group_b="other businesses", n_a=n1, n_b=n2,
                              pct_a=100 * x1 / n1, pct_b=100 * x2 / n2 if n2 else float("nan"),
-                             or_unadjusted=or_raw, p_unadjusted=p_raw, odds_ratio=or_mh, p=p_mh,
-                             adjusted_for="channel"))
+                             or_unadjusted=or_raw, p_unadjusted=p_raw, odds_ratio=or_mh, or_low=lo, or_high=hi,
+                             p=p_mh, adjusted_for="channel"))
         for c in np.unique(ch):
             e = (ch == c).astype(int)
             n1, n2 = int(e.sum()), int((1 - e).sum()); x1, x2 = int(y[e == 1].sum()), int(y[e == 0].sum())
             or_raw, p_raw = two_prop(x1, n1, x2, n2)
-            or_mh, _, p_mh = mantel_haenszel(y, e, bus)
+            or_mh, _, p_mh, lo, hi = mantel_haenszel(y, e, bus, ci=True)
             rows.append(dict(kind="channel", theme=t, group_a=c, group_b="other channels", n_a=n1, n_b=n2,
                              pct_a=100 * x1 / n1, pct_b=100 * x2 / n2 if n2 else float("nan"),
-                             or_unadjusted=or_raw, p_unadjusted=p_raw, odds_ratio=or_mh, p=p_mh,
-                             adjusted_for="business"))
+                             or_unadjusted=or_raw, p_unadjusted=p_raw, odds_ratio=or_mh, or_low=lo, or_high=hi,
+                             p=p_mh, adjusted_for="business"))
         for b in np.unique(bus):
             mb = bus == b
             chs = np.unique(ch[mb])
@@ -142,16 +167,19 @@ def effects(comments, themes, group="detractor"):
                 a = mb & (ch == c); o = mb & (ch != c)
                 n1, n2 = int(a.sum()), int(o.sum()); x1, x2 = int(y[a].sum()), int(y[o].sum())
                 orr, p = two_prop(x1, n1, x2, n2)
+                lo, hi = or_ci(x1, n1, x2, n2)
                 rows.append(dict(kind="cell", theme=t, group_a="%s %s" % (b, c), group_b="%s other channels" % b,
                                  n_a=n1, n_b=n2, pct_a=100 * x1 / n1 if n1 else float("nan"),
                                  pct_b=100 * x2 / n2 if n2 else float("nan"), or_unadjusted=orr, p_unadjusted=p,
-                                 odds_ratio=orr, p=p, adjusted_for="none (within one business)"))
+                                 odds_ratio=orr, or_low=lo, or_high=hi, p=p,
+                                 adjusted_for="none (within one business)"))
     q = bh([r["p"] for r in rows])
     for r, qq in zip(rows, q):
         r["q"] = float(qq)
         r["flag"] = base_flag(min(r["n_a"], r["n_b"]))
         r["significant"] = bool(qq < 0.05 and r["flag"] != "suppress")
-        r["direction"] = "higher" if r["odds_ratio"] > 1 else "lower"
+        o = r["odds_ratio"]
+        r["direction"] = "n/a" if o != o else ("higher" if o > 1 else "lower" if o < 1 else "same")
     return rows
 
 

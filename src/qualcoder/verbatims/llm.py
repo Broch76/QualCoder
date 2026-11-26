@@ -39,8 +39,10 @@ MAX_TOKENS = 8000
 _RX = [
     (re.compile(r"[\w.+-]+@[\w-]+(\.[\w-]+)+"), "[email]"),
     (re.compile(r"https?://\S+|www\.\S+"), "[url]"),
-    (re.compile(r"(?<!\d)\d{13}(?!\d)"), "[id]"),
-    (re.compile(r"(?<![\w])(\+?27|0)[\s-]?\d{2}[\s-]?\d{3}[\s-]?\d{4}(?!\d)"), "[phone]"),
+    (re.compile(r"(?<!\d)\d{6}[\s-]?\d{4}[\s-]?\d{3}(?!\d)"), "[id]"),
+    (re.compile(r"(?<![\w])(\+?27|0)[\s-]?\(?\d{2}\)?[\s-]?\d{3}[\s-]?\d{4}(?!\d)"), "[phone]"),
+    (re.compile(r"\(0\d{2}\)\s?\d{3}[\s-]?\d{4}"), "[phone]"),
+    (re.compile(r"(?<!\d)\d{1,2}[/.-]\d{1,2}[/.-](19|20)\d{2}(?!\d)"), "[date]"),
     (re.compile(r"(?<!\d)\d{6,}(?!\d)"), "[number]"),
 ]
 
@@ -62,7 +64,8 @@ For each comment, return every code from the codebook that the comment clearly e
 - Code what the member says happened, not words that merely appear. "I did not have to wait" is not a delay.
   "Nobody called me back" is no feedback, not a call-centre access problem.
 - A comment can carry several codes, or none.
-- Use "praise" for positive comments about the service or agent, "no_content" for blanks, "n/a", "none",
+- Prefer the specific codebook code over a general one: a praised agent takes the frame's agent-praise code
+  when there is one; "praise" is only for positive comments no other code fits. Use "praise" for those, "no_content" for blanks, "n/a", "none",
   single words or ratings with no reason, and "other" only for a substantive complaint or request that no
   code fits. When you use "other", give a 2 to 5 word English label for what it is about in "other_label".
 - Read Afrikaans and isiZulu in the original language and code them like English.
@@ -158,28 +161,39 @@ def _req(custom_id, model, system, user, schema, effort):
         "output_config": {"effort": effort, "format": {"type": "json_schema", "schema": schema}}}}
 
 
-def coding_requests(comments, book, model=MODEL_BULK, batch=None, context=None):
-    """One request per `batch` comments of one business. custom_id = code-<first index>; indices are
-    positions in `comments` so results map back without ids leaving the machine. context: optional
-    {business: text} describing each business (products, joining routes, channels, current changes); it is
-    added to that business's system prompt."""
+def coding_requests(comments, book, model=MODEL_BULK, batch=None, context=None, seed=11):
+    """Requests of `batch` comments each. Default is BLIND: comments from all businesses are shuffled together
+    (fixed seed) and the prompt names no business, so business comparisons on the codes are not shaped by what
+    the coder was told. context={business: text} switches to per-business requests that carry that text; use
+    it only for experiments (e.g. the context-swap test), never for the codes the statistics use.
+    custom_id = code-<first index>-<hash>; indices are positions in `comments`."""
+    import random
     batch = batch or BATCH
     ids = [b["id"] for b in book]
     base = CODE_SYSTEM + "\n\nCodebook (code [axis; who can act]: label):\n" + _codebook_text(book)
-    order = {}
-    for i, c in enumerate(comments):
-        order.setdefault(c.get("business", ""), []).append(i)
+    groups = []
+    if context is None:
+        idx = list(range(len(comments)))
+        random.Random(seed).shuffle(idx)
+        groups.append((base, idx))
+    else:
+        order = {}
+        for i, c in enumerate(comments):
+            order.setdefault(c.get("business", ""), []).append(i)
+        for bus in sorted(order):
+            system = base
+            if context.get(bus):
+                system += "\n\nAll comments in this request are from members of %s. Context:\n%s" % (bus, context[bus])
+            groups.append((system, order[bus]))
     reqs = []
-    for bus in sorted(order):
-        system = base
-        if context and context.get(bus):
-            system += "\n\nAll comments in this request are from members of %s. Context:\n%s" % (bus, context[bus])
-        idx = order[bus]
+    for system, idx in groups:
         for s in range(0, len(idx), batch):
             chunk = idx[s:s + batch]
             user = "Comments (index: text):\n" + "\n".join(
                 "%d: %s" % (i, redact(comments[i]["text"]).replace("\n", " ")) for i in chunk)
-            reqs.append(_req("code-%d" % chunk[0], model, system, user, code_schema(ids), "low"))
+            r = _req("code-%d" % chunk[0], model, system, user, code_schema(ids), "low")
+            r["_indices"] = chunk          # kept locally to check answers; stripped before sending
+            reqs.append(r)
     return reqs
 
 
@@ -211,6 +225,7 @@ class Claude:
         self.mode, self.dir, self.poll = mode, os.path.join(out_dir, "llm"), poll
         os.makedirs(self.dir, exist_ok=True)
         self.log = []
+        self.models = {}
         if mode == "api":
             import anthropic  # imported only when used
             self.client = anthropic.Anthropic()
@@ -219,6 +234,7 @@ class Claude:
         """Returns {custom_id: parsed JSON output}. Results are cached in llm/<job>.responses.jsonl, so a
         re-run never pays twice for the same job."""
         resp_path = os.path.join(self.dir, job + ".responses.jsonl")
+        requests = [{k: v for k, v in r.items() if not k.startswith("_")} for r in requests]
         with open(os.path.join(self.dir, job + ".requests.jsonl"), "w", encoding="utf-8") as f:
             for r in requests:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
@@ -230,13 +246,21 @@ class Claude:
         if missing:
             new = self._batch(missing) if (use_batch and len(missing) > 1) else self._direct(missing)
             with open(resp_path, "a", encoding="utf-8") as f:
-                for cid, out in new.items():
-                    f.write(json.dumps({"custom_id": cid, "output": out}, ensure_ascii=False) + "\n")
-            got.update(new)
+                for cid, (out, model) in new.items():
+                    f.write(json.dumps({"custom_id": cid, "output": out, "model": model}, ensure_ascii=False) + "\n")
+            got.update({k: v[0] for k, v in new.items()})
+            self.models.update({k: v[1] for k, v in new.items()})
         return got
 
-    @staticmethod
-    def _read(path):
+    def answered_by(self):
+        """Count of answers by the model recorded with each response ("not recorded" when a handoff answer
+        carries none)."""
+        out = {}
+        for m in self.models.values():
+            out[m or "not recorded"] = out.get(m or "not recorded", 0) + 1
+        return out
+
+    def _read(self, path):
         got = {}
         if os.path.exists(path):
             for line in open(path, encoding="utf-8"):
@@ -244,6 +268,7 @@ class Claude:
                     d = json.loads(line)
                     out = d["output"]
                     got[d["custom_id"]] = json.loads(out) if isinstance(out, str) else out
+                    self.models[d["custom_id"]] = d.get("model")
         return got
 
     @staticmethod
@@ -255,12 +280,17 @@ class Claude:
         return json.loads(next(b.text for b in msg.content if b.type == "text"))
 
     def _direct(self, reqs):
+        """One request at a time. A failure (refusal, truncation, API error) is logged and skipped, so the
+        answers already paid for are still written to the cache; the caller sees the gap as unanswered."""
         out = {}
         for r in reqs:
-            msg = self.client.messages.create(**r["params"])
-            out[r["custom_id"]] = self._text(msg)
-            self.log.append({"custom_id": r["custom_id"], "model": msg.model,
-                             "input_tokens": msg.usage.input_tokens, "output_tokens": msg.usage.output_tokens})
+            try:
+                msg = self.client.messages.create(**r["params"])
+                out[r["custom_id"]] = (self._text(msg), msg.model)
+                self.log.append({"custom_id": r["custom_id"], "model": msg.model,
+                                 "input_tokens": msg.usage.input_tokens, "output_tokens": msg.usage.output_tokens})
+            except Exception as e:   # noqa: BLE001 - recorded, not swallowed
+                self.log.append({"custom_id": r["custom_id"], "error": "%s: %s" % (type(e).__name__, e)})
         return out
 
     def _batch(self, reqs):
@@ -274,7 +304,7 @@ class Claude:
         for res in self.client.messages.batches.results(b.id):
             if res.result.type == "succeeded":
                 try:
-                    out[res.custom_id] = self._text(res.result.message)
+                    out[res.custom_id] = (self._text(res.result.message), res.result.message.model)
                 except (RuntimeError, ValueError, StopIteration) as e:
                     failed.append((res.custom_id, str(e)))
             else:
@@ -298,9 +328,10 @@ def code(claude, comments, book, model=MODEL_BULK, job="code", context=None, exp
     other = {}
     seen = set()
     for r in reqs:
-        for it in res[r["custom_id"]]["items"]:
+        allowed = set(r["_indices"])
+        for it in res.get(r["custom_id"], {"items": []})["items"]:
             i = it["i"]
-            if 0 <= i < len(comments):
+            if i in allowed and i not in seen:      # ignore indices the request did not contain
                 themes[i] = {c for c in it["codes"] if c in valid}
                 seen.add(i)
                 if expectation is not None and it.get("expectation"):
@@ -308,6 +339,9 @@ def code(claude, comments, book, model=MODEL_BULK, job="code", context=None, exp
                 if "other" in themes[i] and it.get("other_label"):
                     other[i] = it["other_label"].strip().lower()
     unanswered = len(comments) - len(seen)
+    for i in range(len(comments)):
+        if i not in seen:
+            themes[i] = None                         # unanswered: excluded from bases, not "no code"
     return themes, other, unanswered
 
 

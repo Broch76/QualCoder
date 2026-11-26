@@ -85,18 +85,94 @@ def _expectation_table(sc, exp, th):
     return rows
 
 
-def _tier_table(comments, scope, th, book):
-    """Share of detractor comments carrying at least one code in each controllability tier, by business."""
+def _tier_table(cc, lsc, book):
+    """Share of detractor comments carrying at least one code in each controllability tier, by business.
+    Tiers overlap (a comment can name several), so rows do not sum to 100. "no tier code" = substantive codes
+    only from codes without a tier (induced codes); "no substantive code" = praise, other or nothing."""
     tier = {b["id"]: b.get("tier") for b in book if b.get("tier")}
     rows = []
-    for b in sorted({comments[i]["business"] for i in scope}):
-        idx = [j for j, i in enumerate(scope) if comments[i]["business"] == b and comments[i]["group"] == "detractor"]
+    for bus in sorted({c["business"] for c in cc}):
+        idx = [k for k, c in enumerate(cc) if c["business"] == bus and c["group"] == "detractor"]
         n = len(idx)
-        for t in sorted(set(tier.values())):
-            k = sum(1 for j in idx if any(tier.get(c) == t for c in th[j]))
-            lo, hi = stats.wilson(k, n)
-            rows.append({"business": b, "tier": t, "n_base": n, "n": k, "pct": 100 * k / n if n else 0,
+        cats = {t: (lambda k, t=t: any(tier.get(x) == t for x in lsc[k])) for t in sorted(set(tier.values()))}
+        cats["no tier code"] = lambda k: bool(lsc[k] - {"praise", "other"}) and not any(x in tier for x in lsc[k])
+        cats["no substantive code"] = lambda k: not (lsc[k] - {"praise", "other"})
+        for t, fn in cats.items():
+            x = sum(1 for k in idx if fn(k))
+            lo, hi = stats.wilson(x, n)
+            rows.append({"business": bus, "tier": t, "n_base": n, "n": x, "pct": 100 * x / n if n else 0,
                          "ci_low": 100 * lo, "ci_high": 100 * hi, "flag": stats.base_flag(n)})
+    return rows
+
+
+def _reference_tier_check(cc, path, kw, cl, book, exclude=("unresolved",)):
+    """Tier-level agreement with a hand-coded reference whose CSV has columns id and tier. A comment's coder
+    tier is the most controllable tier among its codes (Health controls > Health influences > Scheme board
+    decides), else "neither". Reported with and without the codes in `exclude`, and against the constant guess."""
+    from collections import Counter
+    rank = ["Health controls", "Health influences", "Scheme board decides"]
+    tier = {b["id"]: b.get("tier") for b in book if b.get("tier")}
+
+    def top(codes, drop=()):
+        ts = {tier[c] for c in codes if c in tier and c not in drop}
+        return next((t for t in rank if t in ts), "neither")
+    ref = {}
+    for r in csv.DictReader(open(path, encoding="utf-8-sig")):
+        if r.get("tier"):
+            ref[r["id"].strip()] = r["tier"].strip()
+    pos = {c["id"]: k for k, c in enumerate(cc)}
+    ids = [i for i in ref if i in pos]
+    rows = []
+    if not ids:
+        return [{"note": "reference has no tier column or no ids match", "n_reference": len(ref)}]
+    modal, modal_n = Counter(ref[i] for i in ids).most_common(1)[0]
+    rows.append({"coder": "constant guess (%s)" % modal, "n": len(ids), "agree": modal_n, "kappa": 0.0})
+    for name, sets in (("keyword", kw), ("claude", cl)):
+        for drop in ((), tuple(exclude)):
+            pred = [top(sets[pos[i]], drop) for i in ids]
+            truth = [ref[i] for i in ids]
+            agree = sum(p == t for p, t in zip(pred, truth))
+            cats = sorted(set(pred) | set(truth))
+            po = agree / len(ids)
+            pe = sum((pred.count(c) / len(ids)) * (truth.count(c) / len(ids)) for c in cats)
+            rows.append({"coder": name + (" without " + ",".join(drop) if drop else ""), "n": len(ids),
+                         "agree": agree, "kappa": round((po - pe) / (1 - pe), 3) if pe < 1 else ""})
+    return rows
+
+
+def _context_swap(claude, llm, sc_all, th, book, ctx, model, notes, per_business=60, seed=5):
+    """Bias check: re-code a stratified sample of answered detractor comments twice, once with the true
+    business context and once with another business's context, and compare code rates with the blind codes."""
+    import random
+    rng = random.Random(seed)
+    buses = sorted(ctx)
+    sample = []
+    for b in buses:
+        idx = [j for j, c in enumerate(sc_all) if c["business"] == b and c["group"] == "detractor" and th[j] is not None]
+        sample += rng.sample(idx, min(per_business, len(idx)))
+    sub = [sc_all[j] for j in sample]
+    rot = {b: ctx[buses[(k + 1) % len(buses)]] for k, b in enumerate(buses)}
+    out = {}
+    for name, cx in (("own context", ctx), ("swapped context", rot)):
+        try:
+            t2, _, _ = llm.code(claude, sub, book, model=model, job="code_" + name.split()[0], context=cx)
+            out[name] = t2
+        except llm.NeedResponses as e:
+            notes.append("Context-swap check pending (%s): %s" % (name, e))
+            return []
+    rows = []
+    for code in [b["id"] for b in book]:
+        for b in buses:
+            ks = [k for k, j in enumerate(sample) if sc_all[j]["business"] == b]
+            r = {"code": code, "business": b, "n": len(ks),
+                 "blind": sum(1 for k in ks if code in th[sample[k]])}
+            for name, t2 in out.items():
+                r[name] = sum(1 for k in ks if t2[k] is not None and code in t2[k])
+            if r["blind"] or any(r[n] for n in out):
+                rows.append(r)
+    notes.append("Context-swap check: %d detractor comments (%d per business) re-coded with their own business "
+                 "context and with another business's context; code counts by business in context_swap_check.csv."
+                 % (len(sample), per_business))
     return rows
 
 
@@ -120,7 +196,7 @@ def _reference_check(comments, path, kw, cl, codes):
 
 
 def run(data, out, backend="lexical", model_path=None, npy=None, codes=None, names=None, k=None, months=None,
-        model_in=None, llm_mode="off", llm_scope="all", llm_model_bulk=None, llm_model_reason=None, families=False, context=None, reference=None):
+        model_in=None, llm_mode="off", llm_scope="all", llm_model_bulk=None, llm_model_reason=None, families=False, context=None, reference=None, definitions=None):
     t0 = time.time()
     warnings.filterwarnings("ignore", message="Number of distinct clusters")
     os.makedirs(out, exist_ok=True)
@@ -190,6 +266,9 @@ def run(data, out, backend="lexical", model_path=None, npy=None, codes=None, nam
             labels = frame_check.load_labels(codes)
             meta = frame_check.load_frame_meta(codes)
             ctx = json.load(open(context)) if context else None
+            if definitions:
+                defs = json.load(open(definitions))
+                labels = {k: (v, defs.get(k, "")) for k, v in labels.items()}
             book = llm.build_codebook(labels, meta=meta)
             induced = None
             try:
@@ -210,37 +289,52 @@ def run(data, out, backend="lexical", model_path=None, npy=None, codes=None, nam
                          and (llm_scope == "all" or c["group"] == "detractor")]
                 try:
                     exp = {}
-                    th, other, unanswered = llm.code(claude, [comments[i] for i in scope], book, model=mb,
-                                                     context=ctx, expectation=exp)
-                    _csv(os.path.join(out, "expectation_by_business.csv"),
-                         _expectation_table([comments[i] for i in scope], exp, th))
-                    _csv(os.path.join(out, "tier_by_business.csv"), _tier_table(comments, scope, th, book))
-                    ls = [set() for _ in comments]
-                    for j, i in enumerate(scope):
-                        ls[i] = th[j] - {"no_content"}
-                    ls_codes = [s - {"praise", "other"} for s in ls]
-                    _csv(os.path.join(out, "effects_claude_codes.csv"), stats.effects(comments, ls))
-                    _csv(os.path.join(out, "prevalence_claude_codes.csv"), stats.prevalence(comments, ls, ("business",)))
-                    _csv(os.path.join(out, "keyword_v_claude.csv"),
-                         llm.agreement(comments, cs, ls, sorted(labels)))
+                    sc_all = [comments[i] for i in scope]
+                    th, other, unanswered = llm.code(claude, sc_all, book, model=mb, expectation=exp)   # blind
+                    keep = [j for j in range(len(scope)) if th[j] is not None]
+                    # Claude tables use answered comments only; the keyword sets are cut to the same base.
+                    cc = [sc_all[j] for j in keep]
+                    lsc = [th[j] - {"no_content"} for j in keep]
+                    kwc = [cs[scope[j]] for j in keep]
+                    expc = {k: exp[j] for k, j in enumerate(keep) if j in exp}
+                    _csv(os.path.join(out, "expectation_by_business.csv"), _expectation_table(cc, expc, lsc))
+                    _csv(os.path.join(out, "tier_by_business.csv"), _tier_table(cc, lsc, book))
+                    _csv(os.path.join(out, "effects_claude_codes.csv"), stats.effects(cc, lsc))
+                    _csv(os.path.join(out, "prevalence_claude_codes.csv"), stats.prevalence(cc, lsc, ("business",)))
+                    _csv(os.path.join(out, "keyword_v_claude.csv"), llm.agreement(cc, kwc, lsc, sorted(labels)))
                     if reference:
-                        _csv(os.path.join(out, "reference_check.csv"),
-                             _reference_check(comments, reference, cs, ls, sorted(labels)))
+                        with open(reference, newline="", encoding="utf-8") as fh:
+                            cols = set(next(csv.reader(fh), []))
+                        if "codes" in cols:
+                            _csv(os.path.join(out, "reference_check.csv"),
+                                 _reference_check(cc, reference, kwc, lsc, sorted(labels)))
+                        if "tier" in cols:
+                            _csv(os.path.join(out, "reference_tier_check.csv"),
+                                 _reference_tier_check(cc, reference, kwc, lsc, book))
+                    if ctx:
+                        _csv(os.path.join(out, "context_swap_check.csv"),
+                             _context_swap(claude, llm, sc_all, th, book, ctx, mb, llm_notes))
                     oc = {}
                     for i, lab in other.items():
                         oc[lab] = oc.get(lab, 0) + 1
                     res["claude_other_labels"] = sorted(oc.items(), key=lambda x: -x[1])[:40]
-                    det = [i for i in scope if comments[i]["group"] == "detractor"]
+                    det = [k for k, c in enumerate(cc) if c["group"] == "detractor"]
                     res["claude_uncoded_share_of_detractor_comments"] = (
-                        sum(1 for i in det if not ls_codes[i]) / max(1, len(det)))
+                        sum(1 for k in det if not (lsc[k] - {"praise", "other"})) / max(1, len(det)))
+                    res["keyword_uncoded_share_same_base"] = sum(1 for k in det if not kwc[k]) / max(1, len(det))
+                    res["claude_unanswered"] = unanswered
+                    res["claude_answered_by"] = claude.answered_by()
                     with open(os.path.join(out, "assignments_claude.csv"), "w", newline="") as f:
-                        w = csv.writer(f); w.writerow(["id", "business", "channel", "group", "codes"])
-                        for i in scope:
-                            c = comments[i]
-                            w.writerow([c["id"], c["business"], c["channel"], c["group"], " | ".join(sorted(ls[i]))])
-                    llm_notes.append("Comment coding: Claude (%s), %d comments (%s), %d per request, Batches API in api "
-                                     "mode; identifiers masked before sending; %d comments unanswered."
-                                     % (mb, len(scope), llm_scope, llm.BATCH, unanswered))
+                        w = csv.writer(f); w.writerow(["id", "business", "channel", "group", "codes", "expectation"])
+                        for k, c in enumerate(cc):
+                            w.writerow([c["id"], c["business"], c["channel"], c["group"], " | ".join(sorted(lsc[k])),
+                                        expc.get(k, "")])
+                    llm_notes.append(
+                        "Comment coding: blind (businesses shuffled together, no business named or described in the "
+                        "prompt), %d comments (%s), %d per request; requested model %s; answers recorded as from: %s; "
+                        "identifiers masked before sending; %d comments unanswered and excluded from every Claude "
+                        "table; keyword comparisons use the same answered base."
+                        % (len(scope), llm_scope, llm.BATCH, mb, json.dumps(claude.answered_by()), unanswered))
                 except llm.NeedResponses as e:
                     llm_notes.append("Comment coding pending: %s" % e)
     _csv(os.path.join(out, "validation_sample.csv"), frame_check.validation_sample(comments, themes))
@@ -258,7 +352,8 @@ def run(data, out, backend="lexical", model_path=None, npy=None, codes=None, nam
                 "k = %d chosen by cosine silhouette among settings with seed stability (adjusted Rand) of at least 0.75; "
                 "stability of the final model %.2f.\n\n" % (json.dumps(tm.embed_info), tm.k, tm.stability))
         f.write("Tests: business v other businesses adjusted for channel (Mantel-Haenszel); channel v other channels "
-                "adjusted for business; within-business channel cells unadjusted. Benjamini-Hochberg across all %d tests; "
+                "adjusted for business; within-business channel cells unadjusted. Benjamini-Hochberg within each table "
+                "(each code set corrected separately; %d topic tests); "
                 "significant = q < 0.05 with both groups n >= 30. Cells under 30 are suppressed; 30 to 99 flagged caution.\n\n"
                 % len(eff))
         f.write("Significant topic effects: %d.\n\n" % len(sig))
@@ -281,15 +376,17 @@ def main(argv=None):
     ap.add_argument("--llm", default="off", choices=["off", "api", "handoff"])
     ap.add_argument("--llm-scope", default="all", choices=["all", "detractor"])
     ap.add_argument("--llm-model-bulk"); ap.add_argument("--llm-model-reason")
-    ap.add_argument("--context", help="JSON {business: context text} for the Claude coding prompts")
-    ap.add_argument("--reference", help="hand-coded reference CSV (id, codes separated by |) to score coders")
+    ap.add_argument("--context", help="JSON {business: context text}; used only for the context-swap check "
+                    "(the coding itself is blind)")
+    ap.add_argument("--definitions", help="JSON {code: definition with inclusions and exclusions}")
+    ap.add_argument("--reference", help="hand-coded reference CSV: columns id and codes (separated by |) and/or id and tier")
     ap.add_argument("--channel-families", action="store_true",
                     help="collapse channel spellings to PHONE, EMAIL, WALK-IN, DIGITAL, OTHER")
     a = ap.parse_args(argv)
     run(a.data, a.out, a.backend, a.model_path, a.npy, a.codes, a.names, a.k,
         [m.strip() for m in a.months.split(",")] if a.months else None, a.model_in,
         a.llm, a.llm_scope, a.llm_model_bulk, a.llm_model_reason, a.channel_families,
-        a.context, a.reference)
+        a.context, a.reference, a.definitions)
 
 
 if __name__ == "__main__":

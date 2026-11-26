@@ -60,6 +60,8 @@ def kappa(a, b):
     n = len(a)
     if n == 0:
         return float("nan")
+    if not a.any() and not b.any():
+        return float("nan")          # neither coder used the code: agreement is undefined, not perfect
     po = (a == b).mean()
     pe = a.mean() * b.mean() + (1 - a.mean()) * (1 - b.mean())
     return float((po - pe) / (1 - pe)) if pe < 1 else 1.0
