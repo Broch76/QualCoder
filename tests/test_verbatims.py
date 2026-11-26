@@ -249,3 +249,12 @@ def test_tier_table_partitions_untiered():
     rows = {r["tier"]: r["n"] for r in rh._tier_table(cc, sets, book)}
     assert rows["Health controls"] == 1 and rows["Health controls (without unresolved)"] == 0
     assert (rows["no tier code"], rows["praise only"], rows["no_content"], rows["nothing"]) == (1, 1, 1, 1)
+
+
+def test_redact_spelled_out_email_keeps_ordinary_text():
+    from qualcoder.verbatims.llm import redact
+    assert redact("not resolved at all. Nobody phoned") == "not resolved at all. Nobody phoned"
+    assert redact("No help at all. They never called back") == "No help at all. They never called back"
+    assert redact("mail john at gmail dot com please") == "mail [email] please"
+    assert redact("john (at) mweb (dot) co (dot) za") == "[email]"
+    assert redact("R150000 owed") == "[amount] owed"

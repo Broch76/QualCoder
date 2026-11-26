@@ -41,11 +41,11 @@ _RX = [
     (re.compile(r"[\w.+-]+@[\w-]+(\.[\w-]+)+"), "[email]"),
     (re.compile(r"https?://\S+|www\.\S+"), "[url]"),
     (re.compile(r"(?<!\d)\d{6}[\s-]?\d{4}[\s-]?\d{3}(?!\d)"), "[id]"),
-    (re.compile(r"\b[\w.+-]+\s*(?:\(at\)|\[at\]| at )\s*[\w-]+\s*(?:\(dot\)|\[dot\]| dot |\.)\s*\w+(?:\.\w+)*", re.I), "[email]"),
+    (re.compile(r"\b[\w.+-]+\s*(?:\(at\)|\[at\]|\sat\s)\s*[\w-]+(?:\s*(?:\(dot\)|\[dot\]|\sdot\s)\s*[\w-]+)*\s*(?:\(dot\)|\[dot\]|\sdot\s)\s*(?:com|co|org|net|gov|ac|za|edu|info|biz)\b(?:\s*(?:\(dot\)|\[dot\]|\sdot\s)\s*(?:za|uk|com|org)\b)*", re.I), "[email]"),
     (re.compile(r"\(0\d{2}\)\s?\d{3}[\s-]?\d{4}"), "[phone]"),
     (re.compile(r"(?<![\w])(\+?27|0)[\s-]?\(?\d{2}\)?[\s-]?\d{3}[\s-]?\d{4}(?!\d)"), "[phone]"),
-    (re.compile(r"\b(?=[A-Za-z]*\d)(?=\d*[A-Za-z])[A-Za-z0-9]{2,}[-/]?\d{4,}\b"), "[ref]"),
     (re.compile(r"\bR\s?\d{1,3}(?:[ ,]\d{3})+(?:\.\d{2})?\b|\bR\s?\d{4,}(?:\.\d{2})?\b"), "[amount]"),
+    (re.compile(r"\b(?=[A-Za-z]*\d)(?=\d*[A-Za-z])[A-Za-z0-9]{2,}[-/]?\d{4,}\b"), "[ref]"),
     (re.compile(r"(?<!\d)\d{1,2}[/.-]\d{1,2}[/.-](19|20)\d{2}(?!\d)"), "[date]"),
     (re.compile(r"(?<!\d)\d{6,}(?!\d)"), "[number]"),
 ]
