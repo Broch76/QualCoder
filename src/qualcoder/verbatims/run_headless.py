@@ -85,24 +85,43 @@ def _expectation_table(sc, exp, th):
     return rows
 
 
-def _tier_table(cc, lsc, book):
-    """Share of detractor comments carrying at least one code in each controllability tier, by business.
-    Tiers overlap (a comment can name several), so rows do not sum to 100. "no tier code" = substantive codes
-    only from codes without a tier (induced codes); "no substantive code" = praise, other or nothing."""
+def _tier_table(cc, lsc, book, drop=("unresolved",)):
+    """Share of detractor comments carrying at least one code in each controllability tier, by business, also
+    with the codes in `drop` removed. Tiers overlap (a comment can name several), so rows do not sum to 100.
+    The remaining rows partition the comments that carry no tiered code: "no tier code" = a substantive code
+    without a tier (induced codes, or "other"); "praise only"; "no_content"; "nothing" (answered, no code)."""
     tier = {b["id"]: b.get("tier") for b in book if b.get("tier")}
+    tiers = sorted(set(tier.values()))
     rows = []
     for bus in sorted({c["business"] for c in cc}):
         idx = [k for k, c in enumerate(cc) if c["business"] == bus and c["group"] == "detractor"]
         n = len(idx)
-        cats = {t: (lambda k, t=t: any(tier.get(x) == t for x in lsc[k])) for t in sorted(set(tier.values()))}
-        cats["no tier code"] = lambda k: bool(lsc[k] - {"praise", "other"}) and not any(x in tier for x in lsc[k])
-        cats["no substantive code"] = lambda k: not (lsc[k] - {"praise", "other"})
+        cats = {}
+        for t in tiers:
+            cats[t] = lambda k, t=t: any(tier.get(x) == t for x in lsc[k])
+            cats[t + " (without %s)" % ", ".join(drop)] = lambda k, t=t: any(tier.get(x) == t for x in lsc[k] if x not in drop)
+        untiered = lambda k: not any(x in tier for x in lsc[k])
+        cats["no tier code"] = lambda k: untiered(k) and bool(lsc[k] - {"praise", "no_content"})
+        cats["praise only"] = lambda k: lsc[k] == {"praise"}
+        cats["no_content"] = lambda k: untiered(k) and "no_content" in lsc[k] and not (lsc[k] - {"praise", "no_content"})
+        cats["nothing"] = lambda k: not lsc[k]
         for t, fn in cats.items():
             x = sum(1 for k in idx if fn(k))
             lo, hi = stats.wilson(x, n)
             rows.append({"business": bus, "tier": t, "n_base": n, "n": x, "pct": 100 * x / n if n else 0,
                          "ci_low": 100 * lo, "ci_high": 100 * hi, "flag": stats.base_flag(n)})
+        # which untiered codes carry the "no tier code" comments
+        nt = [k for k in idx if cats["no tier code"](k)]
+        for code in sorted({x for k in nt for x in lsc[k]} - {"praise", "no_content"}):
+            x = sum(1 for k in nt if code in lsc[k])
+            rows.append({"business": bus, "tier": "no tier code, carried by " + code, "n_base": n, "n": x,
+                         "pct": 100 * x / n if n else 0, "ci_low": "", "ci_high": "", "flag": stats.base_flag(n)})
     return rows
+
+
+def _tier_map(book):
+    return [{"code": b["id"], "label": b["label"], "group": b.get("group", ""), "tier": b.get("tier", "") or "none"}
+            for b in book]
 
 
 def _reference_tier_check(cc, path, kw, cl, book, exclude=("unresolved",)):
@@ -127,22 +146,43 @@ def _reference_tier_check(cc, path, kw, cl, book, exclude=("unresolved",)):
         return [{"note": "reference has no tier column or no ids match", "n_reference": len(ref)}]
     modal, modal_n = Counter(ref[i] for i in ids).most_common(1)[0]
     rows.append({"coder": "constant guess (%s)" % modal, "n": len(ids), "agree": modal_n, "kappa": 0.0})
+    truth = [ref[i] for i in ids]
+    right = {}
     for name, sets in (("keyword", kw), ("claude", cl)):
         for drop in ((), tuple(exclude)):
             pred = [top(sets[pos[i]], drop) for i in ids]
-            truth = [ref[i] for i in ids]
+            label = name + (" without " + ",".join(drop) if drop else "")
             agree = sum(p == t for p, t in zip(pred, truth))
             cats = sorted(set(pred) | set(truth))
             po = agree / len(ids)
             pe = sum((pred.count(c) / len(ids)) * (truth.count(c) / len(ids)) for c in cats)
-            rows.append({"coder": name + (" without " + ",".join(drop) if drop else ""), "n": len(ids),
-                         "agree": agree, "kappa": round((po - pe) / (1 - pe), 3) if pe < 1 else ""})
+            rows.append({"coder": label, "n": len(ids), "agree": agree,
+                         "kappa": round((po - pe) / (1 - pe), 3) if pe < 1 else ""})
+            right[label] = [p == t for p, t in zip(pred, truth)]
+            for t in rank + ["neither"]:            # confusion matrix: reference tier (rows) by coder tier
+                for p_ in rank + ["neither"]:
+                    k = sum(1 for a, b in zip(truth, pred) if a == t and b == p_)
+                    if k:
+                        rows.append({"coder": label, "table": "confusion", "reference_tier": t, "coder_tier": p_, "n": k})
+    right["constant guess"] = [t == modal for t in truth]
+    for a, b in (("claude", "keyword"), ("claude", "constant guess"), ("keyword", "constant guess")):
+        both = sum(x and y for x, y in zip(right[a], right[b])); oa = sum(x and not y for x, y in zip(right[a], right[b]))
+        ob = sum(y and not x for x, y in zip(right[a], right[b])); neither = len(ids) - both - oa - ob
+        d = oa + ob
+        # exact two-sided McNemar on the discordant pairs
+        from math import comb
+        p = min(1.0, 2 * sum(comb(d, k) for k in range(0, min(oa, ob) + 1)) / 2 ** d) if d else 1.0
+        rows.append({"coder": "%s v %s" % (a, b), "table": "paired", "n": len(ids), "both_right": both,
+                     "only_" + a.replace(" ", "_"): oa, "only_" + b.replace(" ", "_"): ob, "both_wrong": neither,
+                     "mcnemar_exact_p": round(p, 5)})
     return rows
 
 
 def _context_swap(claude, llm, sc_all, th, book, ctx, model, notes, per_business=60, seed=5):
-    """Bias check: re-code a stratified sample of answered detractor comments twice, once with the true
-    business context and once with another business's context, and compare code rates with the blind codes."""
+    """Bias check on a stratified sample of answered detractor comments, re-coded three times: blind again
+    (the run-to-run noise floor), with the true business context, and with another business's context.
+    Returns (count rows by code and business, flip rows): a flip is a comment whose code differs between two
+    codings. Comments unanswered in any coding are left out."""
     import random
     rng = random.Random(seed)
     buses = sorted(ctx)
@@ -152,28 +192,50 @@ def _context_swap(claude, llm, sc_all, th, book, ctx, model, notes, per_business
         sample += rng.sample(idx, min(per_business, len(idx)))
     sub = [sc_all[j] for j in sample]
     rot = {b: ctx[buses[(k + 1) % len(buses)]] for k, b in enumerate(buses)}
-    out = {}
-    for name, cx in (("own context", ctx), ("swapped context", rot)):
+    out, exps = {"blind": [th[j] for j in sample]}, {}
+    for name, job, cx in (("blind repeat", "code_blind2", None), ("own context", "code_own", ctx),
+                          ("swapped context", "code_swapped", rot)):
         try:
-            t2, _, _ = llm.code(claude, sub, book, model=model, job="code_" + name.split()[0], context=cx)
-            out[name] = t2
+            e = {}
+            t2, _, _ = llm.code(claude, sub, book, model=model, job=job, context=cx, expectation=e)
+            out[name], exps[name] = t2, e
         except llm.NeedResponses as e:
             notes.append("Context-swap check pending (%s): %s" % (name, e))
-            return []
-    rows = []
+            return [], []
+    ok = [k for k in range(len(sample)) if all(t[k] is not None for t in out.values())]
+    rows, flips = [], []
     for code in [b["id"] for b in book]:
         for b in buses:
-            ks = [k for k, j in enumerate(sample) if sc_all[j]["business"] == b]
-            r = {"code": code, "business": b, "n": len(ks),
-                 "blind": sum(1 for k in ks if code in th[sample[k]])}
+            ks = [k for k in ok if sc_all[sample[k]]["business"] == b]
+            r = {"code": code, "business": b, "n": len(ks)}
             for name, t2 in out.items():
-                r[name] = sum(1 for k in ks if t2[k] is not None and code in t2[k])
-            if r["blind"] or any(r[n] for n in out):
+                r[name] = sum(1 for k in ks if code in t2[k])
+            if any(r[name] for name in out):
                 rows.append(r)
-    notes.append("Context-swap check: %d detractor comments (%d per business) re-coded with their own business "
-                 "context and with another business's context; code counts by business in context_swap_check.csv."
-                 % (len(sample), per_business))
-    return rows
+        for x, y in (("blind", "blind repeat"), ("blind", "own context"), ("blind", "swapped context"),
+                     ("own context", "swapped context")):
+            for b in buses + ["all"]:
+                ks = [k for k in ok if b == "all" or sc_all[sample[k]]["business"] == b]
+                gain = sum(1 for k in ks if code in out[y][k] and code not in out[x][k])
+                loss = sum(1 for k in ks if code in out[x][k] and code not in out[y][k])
+                if gain or loss:
+                    a1 = [code in out[x][k] for k in ks]; a2 = [code in out[y][k] for k in ks]
+                    flips.append({"code": code, "business": b, "pair": "%s v %s" % (x, y), "n": len(ks),
+                                  "added": gain, "removed": loss, "kappa": round(frame_check.kappa(a1, a2), 3)})
+    for x, y in (("own context", "swapped context"), ("blind repeat", "own context")):
+        ks = [k for k in ok if k in exps[x] and k in exps[y]]
+        for s1 in sorted({exps[x][k] for k in ks}):
+            for s2 in sorted({exps[y][k] for k in ks}):
+                n = sum(1 for k in ks if exps[x][k] == s1 and exps[y][k] == s2)
+                if n:
+                    flips.append({"code": "expectation", "business": "all", "pair": "%s v %s" % (x, y),
+                                  "from": s1, "to": s2, "n": n})
+    notes.append("Context-swap check: %d detractor comments (%d per business; %d answered in every coding) "
+                 "re-coded blind again, with their own business context and with another business's context. "
+                 "Counts in context_swap_check.csv; per-comment changes in context_swap_flips.csv. The blind repeat "
+                 "is the noise floor: context effects are only those larger than blind v blind repeat."
+                 % (len(sample), per_business, len(ok)))
+    return rows, flips
 
 
 def _reference_check(comments, path, kw, cl, codes):
@@ -298,7 +360,8 @@ def run(data, out, backend="lexical", model_path=None, npy=None, codes=None, nam
                     kwc = [cs[scope[j]] for j in keep]
                     expc = {k: exp[j] for k, j in enumerate(keep) if j in exp}
                     _csv(os.path.join(out, "expectation_by_business.csv"), _expectation_table(cc, expc, lsc))
-                    _csv(os.path.join(out, "tier_by_business.csv"), _tier_table(cc, lsc, book))
+                    _csv(os.path.join(out, "tier_by_business.csv"), _tier_table(cc, [th[j] for j in keep], book))
+                    _csv(os.path.join(out, "code_tier_map.csv"), _tier_map(book))
                     _csv(os.path.join(out, "effects_claude_codes.csv"), stats.effects(cc, lsc))
                     _csv(os.path.join(out, "prevalence_claude_codes.csv"), stats.prevalence(cc, lsc, ("business",)))
                     _csv(os.path.join(out, "keyword_v_claude.csv"), llm.agreement(cc, kwc, lsc, sorted(labels)))
@@ -312,8 +375,9 @@ def run(data, out, backend="lexical", model_path=None, npy=None, codes=None, nam
                             _csv(os.path.join(out, "reference_tier_check.csv"),
                                  _reference_tier_check(cc, reference, kwc, lsc, book))
                     if ctx:
-                        _csv(os.path.join(out, "context_swap_check.csv"),
-                             _context_swap(claude, llm, sc_all, th, book, ctx, mb, llm_notes))
+                        sw_rows, sw_flips = _context_swap(claude, llm, sc_all, th, book, ctx, mb, llm_notes)
+                        _csv(os.path.join(out, "context_swap_check.csv"), sw_rows)
+                        _csv(os.path.join(out, "context_swap_flips.csv"), sw_flips)
                     oc = {}
                     for i, lab in other.items():
                         oc[lab] = oc.get(lab, 0) + 1
@@ -329,12 +393,21 @@ def run(data, out, backend="lexical", model_path=None, npy=None, codes=None, nam
                         for k, c in enumerate(cc):
                             w.writerow([c["id"], c["business"], c["channel"], c["group"], " | ".join(sorted(lsc[k])),
                                         expc.get(k, "")])
+                    named = sum(1 for c in cc if c["business"].lower() in c["text"].lower())
                     llm_notes.append(
-                        "Comment coding: blind (businesses shuffled together, no business named or described in the "
-                        "prompt), %d comments (%s), %d per request; requested model %s; answers recorded as from: %s; "
-                        "identifiers masked before sending; %d comments unanswered and excluded from every Claude "
-                        "table; keyword comparisons use the same answered base."
-                        % (len(scope), llm_scope, llm.BATCH, mb, json.dumps(claude.answered_by()), unanswered))
+                        "Comment coding: no business named or described in the prompt (businesses shuffled together; "
+                        "the codebook shows each code's axis but not its tier). Scheme names inside comment text are not "
+                        "masked: %d of %d coded comments name their own business label. %d comments (%s), %d per "
+                        "request; requested model %s; answers recorded as from: %s; identifiers masked before sending; "
+                        "%d comments unanswered and excluded from every Claude table; keyword comparisons use the same "
+                        "answered base."
+                        % (named, len(cc), len(scope), llm_scope, llm.BATCH, mb, json.dumps(claude.answered_by()),
+                           unanswered))
+                    llm_notes.append(
+                        "Tiers: a comment's tier for the reference check is the most controllable tier among its codes "
+                        "(Health controls, then Health influences, then Scheme board decides), else neither. In "
+                        "tier_by_business.csv a comment counts in every tier it has a code in. Code-to-tier map in "
+                        "code_tier_map.csv; induced codes and \"other\" carry no tier.")
                 except llm.NeedResponses as e:
                     llm_notes.append("Comment coding pending: %s" % e)
     _csv(os.path.join(out, "validation_sample.csv"), frame_check.validation_sample(comments, themes))

@@ -3,6 +3,8 @@ import sys
 import numpy as np
 import pandas as pd
 import pytest
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 from qualcoder.verbatims import load, stats, topics, frame_check, text
 from qualcoder.verbatims.embed import LexicalEmbedder
@@ -188,3 +190,62 @@ def test_api_batch_path_with_fake_client(tmp_path):
     finally:
         llm.BATCH = old
     assert th2 == th
+
+
+def test_effects_direction_empty_group_and_sparse_cells():
+    # Business A: 0 of 20 on EMAIL v B 1 of 200: no odds ratio shown, direction from shares, not significant.
+    cm, th = [], []
+    for b, ch, n, x in (("A", "EMAIL", 20, 0), ("B", "EMAIL", 200, 1), ("A", "PHONE", 50, 5), ("B", "PHONE", 50, 5)):
+        for k in range(n):
+            cm.append({"business": b, "channel": ch, "group": "detractor"}); th.append({"t"} if k < x else set())
+    rows = stats.effects(cm, th)
+    cell = [r for r in rows if r["kind"] == "cell" and r["group_a"] == "A EMAIL"][0]
+    assert cell["odds_ratio"] != cell["odds_ratio"] and cell["direction"] == "lower"
+    assert cell["test"] == "Fisher exact" and not cell["significant"]
+    bus = [r for r in rows if r["kind"] == "business" and r["group_a"] == "A"][0]
+    assert bus["direction"] in ("higher", "lower", "same") and "direction_disagree" in bus
+
+
+def test_effects_direction_follows_adjusted_ratio():
+    # Simpson set-up: A has the higher rate within each channel but sits mostly in the low-rate channel.
+    cm, th = [], []
+    for b, ch, n, x in (("A", "LOW", 180, 18), ("A", "HIGH", 20, 12), ("B", "LOW", 20, 1), ("B", "HIGH", 180, 90)):
+        for k in range(n):
+            cm.append({"business": b, "channel": ch, "group": "detractor"}); th.append({"t"} if k < x else set())
+    r = [r for r in stats.effects(cm, th) if r["kind"] == "business" and r["group_a"] == "A"][0]
+    assert r["pct_a"] < r["pct_b"] and r["odds_ratio"] > 1
+    assert r["direction"] == "higher" and r["direction_disagree"]
+
+
+def test_codebook_text_hides_tier():
+    from qualcoder.verbatims import llm
+    book = llm.build_codebook({"claims": "Claims"}, meta={"claims": {"group": "topic", "tier": "Health controls"}})
+    t = llm._codebook_text(book)
+    assert "topic" in t and "Health controls" not in t
+
+
+def test_reference_tier_check_paired(tmp_path):
+    from qualcoder.verbatims import run_headless as rh
+    book = [{"id": "a", "tier": "Health controls"}, {"id": "b", "tier": "Scheme board decides"}]
+    cc = [{"id": str(i)} for i in range(6)]
+    kw = [{"a"}, {"a"}, {"b"}, set(), {"a"}, {"a"}]
+    cl = [{"a"}, {"a"}, {"b"}, {"b"}, {"b"}, set()]
+    ref = tmp_path / "r.csv"
+    ref.write_text("id,tier\n0,Health controls\n1,Health controls\n2,Scheme board decides\n"
+                   "3,Scheme board decides\n4,Health controls\n5,neither\n")
+    rows = rh._reference_tier_check(cc, str(ref), kw, cl, book)
+    main = {r["coder"]: r for r in rows if "table" not in r}
+    assert main["claude"]["agree"] == 5 and main["keyword"]["agree"] == 4
+    paired = [r for r in rows if r.get("table") == "paired" and r["coder"] == "claude v keyword"][0]
+    assert (paired["both_right"], paired["only_claude"], paired["only_keyword"], paired["both_wrong"]) == (3, 2, 1, 0)
+    assert any(r.get("table") == "confusion" for r in rows)
+
+
+def test_tier_table_partitions_untiered():
+    from qualcoder.verbatims import run_headless as rh
+    book = [{"id": "unresolved", "tier": "Health controls"}, {"id": "x"}]
+    cc = [{"business": "A", "group": "detractor"} for _ in range(5)]
+    sets = [{"unresolved"}, {"x"}, {"praise"}, {"no_content"}, set()]
+    rows = {r["tier"]: r["n"] for r in rh._tier_table(cc, sets, book)}
+    assert rows["Health controls"] == 1 and rows["Health controls (without unresolved)"] == 0
+    assert (rows["no tier code"], rows["praise only"], rows["no_content"], rows["nothing"]) == (1, 1, 1, 1)

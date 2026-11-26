@@ -19,9 +19,10 @@ Two transports, same requests:
            OUT/llm/<job>.responses.jsonl, one {"custom_id", "output"} object per line; the next run
            reads them. Use it where the analysis machine cannot reach the API.
 
-Before any text leaves the machine, identifiers are masked (redact): e-mail addresses, phone numbers,
-13-digit ID numbers, long digit runs (member, policy and claim numbers) and URLs. Names in free text are
-not masked; the datasets are pseudonymised at source.
+Before any text leaves the machine, identifiers are masked (redact): e-mail addresses (also spelled out),
+phone numbers, 13-digit ID numbers, alphanumeric reference numbers, rand amounts (kept as "[amount]" so the
+meaning survives), dates, long digit runs and URLs. Names and street addresses in free text are not masked;
+the datasets are pseudonymised at source.
 
 Models: coding uses claude-haiku-5-5 (a bulk classification task); naming and induction use
 claude-opus-5-5. Both can be changed with --llm-model-bulk / --llm-model-reason.
@@ -40,8 +41,11 @@ _RX = [
     (re.compile(r"[\w.+-]+@[\w-]+(\.[\w-]+)+"), "[email]"),
     (re.compile(r"https?://\S+|www\.\S+"), "[url]"),
     (re.compile(r"(?<!\d)\d{6}[\s-]?\d{4}[\s-]?\d{3}(?!\d)"), "[id]"),
-    (re.compile(r"(?<![\w])(\+?27|0)[\s-]?\(?\d{2}\)?[\s-]?\d{3}[\s-]?\d{4}(?!\d)"), "[phone]"),
+    (re.compile(r"\b[\w.+-]+\s*(?:\(at\)|\[at\]| at )\s*[\w-]+\s*(?:\(dot\)|\[dot\]| dot |\.)\s*\w+(?:\.\w+)*", re.I), "[email]"),
     (re.compile(r"\(0\d{2}\)\s?\d{3}[\s-]?\d{4}"), "[phone]"),
+    (re.compile(r"(?<![\w])(\+?27|0)[\s-]?\(?\d{2}\)?[\s-]?\d{3}[\s-]?\d{4}(?!\d)"), "[phone]"),
+    (re.compile(r"\b(?=[A-Za-z]*\d)(?=\d*[A-Za-z])[A-Za-z0-9]{2,}[-/]?\d{4,}\b"), "[ref]"),
+    (re.compile(r"\bR\s?\d{1,3}(?:[ ,]\d{3})+(?:\.\d{2})?\b|\bR\s?\d{4,}(?:\.\d{2})?\b"), "[amount]"),
     (re.compile(r"(?<!\d)\d{1,2}[/.-]\d{1,2}[/.-](19|20)\d{2}(?!\d)"), "[date]"),
     (re.compile(r"(?<!\d)\d{6,}(?!\d)"), "[number]"),
 ]
@@ -65,9 +69,10 @@ For each comment, return every code from the codebook that the comment clearly e
   "Nobody called me back" is no feedback, not a call-centre access problem.
 - A comment can carry several codes, or none.
 - Prefer the specific codebook code over a general one: a praised agent takes the frame's agent-praise code
-  when there is one; "praise" is only for positive comments no other code fits. Use "praise" for those, "no_content" for blanks, "n/a", "none",
-  single words or ratings with no reason, and "other" only for a substantive complaint or request that no
-  code fits. When you use "other", give a 2 to 5 word English label for what it is about in "other_label".
+  when there is one; "praise" is only for positive comments no other code fits. Use "no_content" for blanks,
+  "n/a", "none", single words or ratings with no reason, and "other" only for a substantive complaint or
+  request that no code fits.
+- Apply each code's definition, including its exclusions, strictly. When you use "other", give a 2 to 5 word English label for what it is about in "other_label".
 - Read Afrikaans and isiZulu in the original language and code them like English.
 - For each comment also say where the member's expectation was set, in "expectation": "service interaction"
   when the complaint is about how this contact was handled; "product or benefit design" when it is about what
@@ -141,8 +146,10 @@ def build_codebook(labels=None, induced=None, meta=None):
 
 
 def _codebook_text(book):
+    # Axis only. The controllability tier is NOT shown: tier agreement with a human reader is the validation,
+    # so the coder must not be able to pick codes by who is to blame.
     def tag(b):
-        t = [x for x in (b.get("group"), b.get("tier")) if x]
+        t = [x for x in (b.get("group"),) if x]
         return " [%s]" % "; ".join(t) if t else ""
     return "\n".join("- %s%s: %s%s" % (b["id"], tag(b), b["label"], (". " + b["definition"]) if b.get("definition") else "")
                      for b in book)
@@ -161,7 +168,7 @@ def _req(custom_id, model, system, user, schema, effort):
         "output_config": {"effort": effort, "format": {"type": "json_schema", "schema": schema}}}}
 
 
-def coding_requests(comments, book, model=MODEL_BULK, batch=None, context=None, seed=11):
+def coding_requests(comments, book, model=MODEL_BULK, batch=None, context=None, seed=11, indices=None):
     """Requests of `batch` comments each. Default is BLIND: comments from all businesses are shuffled together
     (fixed seed) and the prompt names no business, so business comparisons on the codes are not shaped by what
     the coder was told. context={business: text} switches to per-business requests that carry that text; use
@@ -170,16 +177,18 @@ def coding_requests(comments, book, model=MODEL_BULK, batch=None, context=None, 
     import random
     batch = batch or BATCH
     ids = [b["id"] for b in book]
-    base = CODE_SYSTEM + "\n\nCodebook (code [axis; who can act]: label):\n" + _codebook_text(book)
+    base = CODE_SYSTEM + "\n\nCodebook (code [axis]: label. definition):\n" + _codebook_text(book)
     groups = []
+    keep = None if indices is None else set(indices)
     if context is None:
-        idx = list(range(len(comments)))
+        idx = [i for i in range(len(comments)) if keep is None or i in keep]
         random.Random(seed).shuffle(idx)
         groups.append((base, idx))
     else:
         order = {}
         for i, c in enumerate(comments):
-            order.setdefault(c.get("business", ""), []).append(i)
+            if keep is None or i in keep:
+                order.setdefault(c.get("business", ""), []).append(i)
         for bus in sorted(order):
             system = base
             if context.get(bus):
@@ -320,24 +329,44 @@ class Claude:
 
 def code(claude, comments, book, model=MODEL_BULK, job="code", context=None, expectation=None):
     """Returns (themes, other_labels, unanswered): a set of code ids per comment, the "other" labels by index,
-    and the count of comments with no answer. Pass a dict as `expectation` to receive {index: source}."""
-    reqs = coding_requests(comments, book, model=model, context=context)
-    res = claude.run(job, reqs)
+    and the count of comments with no answer. Pass a dict as `expectation` to receive {index: source}.
+    Comments a request left out are asked once more in a "<job>_retry" request set; a comment answered twice
+    keeps its first answer and the duplicate is logged."""
     valid = {b["id"] for b in book}
     themes = [set() for _ in comments]
     other = {}
     seen = set()
-    for r in reqs:
-        allowed = set(r["_indices"])
-        for it in res.get(r["custom_id"], {"items": []})["items"]:
-            i = it["i"]
-            if i in allowed and i not in seen:      # ignore indices the request did not contain
+    dup = 0
+
+    def take(reqs, res):
+        nonlocal dup
+        for r in reqs:
+            allowed = set(r["_indices"])
+            for it in res.get(r["custom_id"], {"items": []})["items"]:
+                i = it["i"]
+                if i not in allowed:                  # ignore indices the request did not contain
+                    continue
+                if i in seen:
+                    dup += 1
+                    continue
                 themes[i] = {c for c in it["codes"] if c in valid}
                 seen.add(i)
                 if expectation is not None and it.get("expectation"):
                     expectation[i] = it["expectation"]
                 if "other" in themes[i] and it.get("other_label"):
                     other[i] = it["other_label"].strip().lower()
+
+    reqs = coding_requests(comments, book, model=model, context=context)
+    take(reqs, claude.run(job, reqs))
+    missing = [i for i in range(len(comments)) if i not in seen]
+    if missing and len(missing) < len(comments):
+        rr = coding_requests(comments, book, model=model, context=context, seed=12, indices=missing)
+        try:
+            take(rr, claude.run(job + "_retry", rr))
+        except NeedResponses:
+            pass                                      # handoff: answered on the next run
+    if dup and hasattr(claude, "log"):
+        claude.log.append({"job": job, "duplicate_answers_ignored": dup})
     unanswered = len(comments) - len(seen)
     for i in range(len(comments)):
         if i not in seen:

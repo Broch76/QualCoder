@@ -9,13 +9,16 @@ Unit of analysis is the respondent comment (a comment counts once per theme howe
 - Channel effect: channel v the rest, stratified by business.
 - Cell effect: within one business, one channel v that business's other channels.
 - Detractor v promoter lift per theme.
-All p-values in one run are adjusted together (Benjamini-Hochberg); "significant" means q < 0.05 and
-both compared groups have n >= 30.
+Benjamini-Hochberg is applied within each effects table (one code set); "significant" means q < 0.05, both
+compared groups have n >= 30, and the two groups hold at least 10 coded comments between them. Sparse 2x2
+tables (an expected count under 5) use Fisher's exact test. No odds ratio is shown for a group with no coded
+comments, or for a suppressed comparison.
 """
 import math
 import numpy as np
 
 SUPPRESS, CAUTION = 30, 100
+MIN_EVENTS = 10
 
 
 def base_flag(n):
@@ -87,6 +90,23 @@ def two_prop(x1, n1, x2, n2):
     return (a * d) / (b * c), chi2_p(stat)
 
 
+def fisher_p(x1, n1, x2, n2):
+    """Two-sided Fisher exact p for a 2x2 table, or None if scipy is missing."""
+    try:
+        from scipy.stats import fisher_exact
+    except ImportError:
+        return None
+    return float(fisher_exact([[x1, n1 - x1], [x2, n2 - x2]])[1])
+
+
+def sparse(x1, n1, x2, n2):
+    """True when any expected cell count of the 2x2 table is under 5."""
+    n = n1 + n2; x = x1 + x2
+    if n == 0:
+        return True
+    return min(n1 * x, n1 * (n - x), n2 * x, n2 * (n - x)) / n < 5
+
+
 def or_ci(x1, n1, x2, n2):
     """Woolf 95% interval for the unadjusted odds ratio (Haldane-corrected if a cell is empty)."""
     a, b, c, d = x1, n1 - x1, x2, n2 - x2
@@ -148,7 +168,7 @@ def effects(comments, themes, group="detractor"):
             rows.append(dict(kind="business", theme=t, group_a=b, group_b="other businesses", n_a=n1, n_b=n2,
                              pct_a=100 * x1 / n1, pct_b=100 * x2 / n2 if n2 else float("nan"),
                              or_unadjusted=or_raw, p_unadjusted=p_raw, odds_ratio=or_mh, or_low=lo, or_high=hi,
-                             p=p_mh, adjusted_for="channel"))
+                             p=p_mh, x_a=x1, x_b=x2, test="Mantel-Haenszel", adjusted_for="channel"))
         for c in np.unique(ch):
             e = (ch == c).astype(int)
             n1, n2 = int(e.sum()), int((1 - e).sum()); x1, x2 = int(y[e == 1].sum()), int(y[e == 0].sum())
@@ -157,7 +177,7 @@ def effects(comments, themes, group="detractor"):
             rows.append(dict(kind="channel", theme=t, group_a=c, group_b="other channels", n_a=n1, n_b=n2,
                              pct_a=100 * x1 / n1, pct_b=100 * x2 / n2 if n2 else float("nan"),
                              or_unadjusted=or_raw, p_unadjusted=p_raw, odds_ratio=or_mh, or_low=lo, or_high=hi,
-                             p=p_mh, adjusted_for="business"))
+                             p=p_mh, x_a=x1, x_b=x2, test="Mantel-Haenszel", adjusted_for="business"))
         for b in np.unique(bus):
             mb = bus == b
             chs = np.unique(ch[mb])
@@ -167,19 +187,36 @@ def effects(comments, themes, group="detractor"):
                 a = mb & (ch == c); o = mb & (ch != c)
                 n1, n2 = int(a.sum()), int(o.sum()); x1, x2 = int(y[a].sum()), int(y[o].sum())
                 orr, p = two_prop(x1, n1, x2, n2)
+                test = "chi-square"
+                if sparse(x1, n1, x2, n2):
+                    fp = fisher_p(x1, n1, x2, n2)
+                    if fp is not None:
+                        p, test = fp, "Fisher exact"
                 lo, hi = or_ci(x1, n1, x2, n2)
                 rows.append(dict(kind="cell", theme=t, group_a="%s %s" % (b, c), group_b="%s other channels" % b,
                                  n_a=n1, n_b=n2, pct_a=100 * x1 / n1 if n1 else float("nan"),
                                  pct_b=100 * x2 / n2 if n2 else float("nan"), or_unadjusted=orr, p_unadjusted=p,
-                                 odds_ratio=orr, or_low=lo, or_high=hi, p=p,
+                                 odds_ratio=orr, or_low=lo, or_high=hi, p=p, x_a=x1, x_b=x2, test=test,
                                  adjusted_for="none (within one business)"))
     q = bh([r["p"] for r in rows])
     for r, qq in zip(rows, q):
         r["q"] = float(qq)
         r["flag"] = base_flag(min(r["n_a"], r["n_b"]))
-        r["significant"] = bool(qq < 0.05 and r["flag"] != "suppress")
-        o = r["odds_ratio"]
-        r["direction"] = "n/a" if o != o else ("higher" if o > 1 else "lower" if o < 1 else "same")
+        r["significant"] = bool(qq < 0.05 and r["flag"] != "suppress" and r["x_a"] + r["x_b"] >= MIN_EVENTS)
+        pa, pb = r["pct_a"], r["pct_b"]
+        ds = "n/a" if pa != pa or pb != pb else ("higher" if pa > pb else "lower" if pa < pb else "same")
+        if r["x_a"] == 0 or r["x_b"] == 0 or r["flag"] == "suppress":
+            # An empty group or a suppressed base gives no meaningful odds ratio (the 0.5 correction can put it
+            # above 1 with no cases); show none and take the direction from the shares.
+            for k in ("odds_ratio", "or_low", "or_high", "or_unadjusted"):
+                r[k] = float("nan")
+            r["direction"] = ds
+        else:
+            o = r["odds_ratio"]
+            # Adjusted rows: direction from the adjusted odds ratio, which can differ from the crude shares.
+            r["direction"] = ds if o != o else ("higher" if o > 1 else "lower" if o < 1 else "same")
+        r["direction_shares"] = ds
+        r["direction_disagree"] = bool(ds not in ("n/a", r["direction"]))
     return rows
 
 
