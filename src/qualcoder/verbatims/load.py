@@ -10,6 +10,21 @@ DEFAULT_CHANNEL_MAP = {"TELEPHONE": "TELEPHONIC", "PHONE": "TELEPHONIC", "CALL C
                        "WALK IN": "COUNTER CALLS"}
 
 
+def channel_family(c):
+    """Collapse the channel spellings different administrators use into five families, so channel
+    adjustment compares like with like across businesses: PHONE, EMAIL, WALK-IN, DIGITAL, OTHER."""
+    c = str(c).upper().strip()
+    if c.startswith(("TELEPHON", "IN CALL", "OUT CALL", "PHONE", "CALL CENTRE")):
+        return "PHONE"
+    if c.startswith(("EMAIL", "E-MAIL", "MAIL")):
+        return "EMAIL"
+    if c.startswith(("WALK", "COUNTER")):
+        return "WALK-IN"
+    if c.startswith(("WEB", "MOBILE", "APP", "ONLINE")):
+        return "DIGITAL"
+    return "OTHER"
+
+
 def nps_group(score):
     if score is None or (isinstance(score, float) and np.isnan(score)):
         return None
@@ -19,7 +34,7 @@ def nps_group(score):
 
 def load_verbatims(df, business=None, text_col="Free Response", score_col="QNet Promoter Score",
                    channel_col="Interaction Channel", month_col="Month", id_col="Response ID",
-                   business_col="business", months=None, channel_map=None, min_chars=3):
+                   business_col="business", months=None, channel_map=None, min_chars=3, families=False):
     """Return (comments, trail).
 
     comments: list of dicts {id, business, channel, month, score, group, text, no_content}
@@ -46,6 +61,8 @@ def load_verbatims(df, business=None, text_col="Free Response", score_col="QNet 
     trail.append(("blank or skipped comment", int((~blank).sum()), int(blank.sum())))
     d, score, txt = d[~blank], score[~blank], txt[~blank]
     ch = d[channel_col].astype(str).str.upper().str.strip().map(lambda c: cmap.get(c, c)) if channel_col in d else "ALL"
+    if families and not isinstance(ch, str):
+        ch = ch.map(channel_family)
     bus = business if business is not None else d[business_col].astype(str)
     comments = []
     for i, (idx, row) in enumerate(d.iterrows()):

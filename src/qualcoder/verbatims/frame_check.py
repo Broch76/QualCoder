@@ -24,6 +24,17 @@ def load_codes(path):
     return {k: (re.compile(v, re.I) if isinstance(v, str) else v) for k, v in raw.items()}
 
 
+def load_labels(path):
+    """Human labels for a code frame file: ALL entries give (group, label, regex); CODES gives none."""
+    spec = importlib.util.spec_from_file_location("code_frame_labels", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    if hasattr(mod, "ALL"):
+        return {k: v[1] for k, v in mod.ALL.items()}
+    labels = getattr(mod, "LABELS", {})
+    return {k: labels.get(k, k.replace("_", " ")) for k in mod.CODES}
+
+
 def apply_codes(comments, codes):
     out = []
     for c in comments:

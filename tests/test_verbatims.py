@@ -99,3 +99,88 @@ def test_topic_model_multilabel_and_frame_check():
     cs = frame_check.apply_codes(comments, codes)
     rows = frame_check.topic_vs_codes(comments, tm.themes(), cs)
     assert sum(r["status"] == "frame misses this" for r in rows) == 2   # app and transfer topics are uncoded
+
+
+# ---- Claude layer (no network: handoff files and a fake client) ----
+
+def test_redact_masks_identifiers():
+    from qualcoder.verbatims.llm import redact
+    t = redact("mail me a.b@x.co.za or 082 555 1234, ID 8001015009087, member 12345678, see https://x.y/z")
+    assert "@" not in t and "555" not in t and "8001015009087" not in t and "12345678" not in t and "https" not in t
+    assert redact("waited 3 weeks") == "waited 3 weeks"
+
+
+def _mini_comments():
+    rows = [("the claim was paid short", 2), ("nobody called me back", 3), ("baie stadig", 1),
+            ("excellent service", 10), ("I did not have to wait", 9)]
+    return [{"id": str(i), "business": "A", "channel": "EMAIL", "month": "m", "score": s,
+             "group": "detractor" if s <= 6 else "promoter", "text": t, "no_content": False}
+            for i, (t, s) in enumerate(rows)]
+
+
+def test_handoff_round_trip(tmp_path):
+    import json, pytest
+    from qualcoder.verbatims import llm
+    cm = _mini_comments()
+    book = llm.build_codebook({"claims": "Claims", "delay": "Took too long", "no_feedback": "No feedback"})
+    assert [b["id"] for b in book][-3:] == ["praise", "other", "no_content"]
+    c = llm.Claude("handoff", str(tmp_path))
+    with pytest.raises(llm.NeedResponses):
+        llm.code(c, cm, book)
+    reqs = [json.loads(l) for l in open(tmp_path / "llm" / "code.requests.jsonl")]
+    assert len(reqs) == 1 and reqs[0]["params"]["output_config"]["format"]["type"] == "json_schema"
+    enum = reqs[0]["params"]["output_config"]["format"]["schema"]["properties"]["items"]["items"]["properties"]["codes"]["items"]["enum"]
+    assert "claims" in enum and "praise" in enum
+    ans = {"items": [{"i": 0, "codes": ["claims"], "other_label": ""}, {"i": 1, "codes": ["no_feedback"], "other_label": ""},
+                     {"i": 2, "codes": ["delay"], "other_label": ""}, {"i": 3, "codes": ["praise", "bogus"], "other_label": ""},
+                     {"i": 4, "codes": ["praise"], "other_label": ""}]}
+    with open(tmp_path / "llm" / "code.responses.jsonl", "w") as f:
+        f.write(json.dumps({"custom_id": reqs[0]["custom_id"], "output": json.dumps(ans)}) + "\n")
+    th, other, missing = llm.code(c, cm, book)
+    assert th[0] == {"claims"} and th[2] == {"delay"} and th[3] == {"praise"} and missing == 0
+    rows = llm.agreement(cm, [{"claims"}, set(), set(), set(), {"delay"}], th, ["claims", "delay"])
+    d = {r["code"]: r for r in rows}
+    assert d["claims"]["n_both"] == 1 and d["delay"]["n_claude"] == 1
+
+
+def test_api_batch_path_with_fake_client(tmp_path):
+    import json, types
+    from qualcoder.verbatims import llm
+    cm = _mini_comments()
+    book = llm.build_codebook({"claims": "Claims"})
+
+    def msg(obj):
+        return types.SimpleNamespace(stop_reason="end_turn", model="m",
+                                     content=[types.SimpleNamespace(type="text", text=json.dumps(obj))],
+                                     usage=types.SimpleNamespace(input_tokens=1, output_tokens=1))
+
+    class Batches:
+        def create(self, requests):
+            self.reqs = requests; return types.SimpleNamespace(id="b1", processing_status="in_progress")
+        def retrieve(self, bid):
+            return types.SimpleNamespace(id=bid, processing_status="ended")
+        def results(self, bid):
+            for r in self.reqs:
+                s = int(r["custom_id"].split("-")[1])
+                items = [{"i": s + j, "codes": ["claims"] if s + j == 0 else [], "other_label": ""} for j in range(2)]
+                yield types.SimpleNamespace(custom_id=r["custom_id"],
+                                            result=types.SimpleNamespace(type="succeeded", message=msg({"items": items})))
+
+    c = llm.Claude.__new__(llm.Claude)
+    c.mode, c.dir, c.poll, c.log = "api", str(tmp_path), 0, []
+    c.client = types.SimpleNamespace(messages=types.SimpleNamespace(batches=Batches(), create=None))
+    old = llm.BATCH
+    try:
+        llm.BATCH = 2
+        th, _, missing = llm.code(c, cm, book)
+    finally:
+        llm.BATCH = old
+    assert th[0] == {"claims"} and missing == 0
+    # second call is served from the cache file, no client needed
+    c.client = None
+    llm.BATCH = 2
+    try:
+        th2, _, _ = llm.code(c, cm, book)
+    finally:
+        llm.BATCH = old
+    assert th2 == th
