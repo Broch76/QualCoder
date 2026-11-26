@@ -35,6 +35,18 @@ def load_labels(path):
     return {k: labels.get(k, k.replace("_", " ")) for k in mod.CODES}
 
 
+def load_frame_meta(path):
+    """{code: {"group", "tier"}} from a frame that defines ALL = {k: (group, label, regex)} and TIER = {k: tier}."""
+    spec = importlib.util.spec_from_file_location("code_frame_meta", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    names = {"mode": "failure mode", "topic": "topic", "signal": "signal"}
+    tier = getattr(mod, "TIER", {})
+    if hasattr(mod, "ALL"):
+        return {k: {"group": names.get(v[0], str(v[0])), "tier": tier.get(k, "")} for k, v in mod.ALL.items()}
+    return {k: {"group": "", "tier": tier.get(k, "")} for k in getattr(mod, "CODES", {})}
+
+
 def apply_codes(comments, codes):
     out = []
     for c in comments:

@@ -5,6 +5,7 @@ python -m qualcoder.verbatims.run_headless --data DIR_WITH_voc_PKLS --out OUT_DI
     [--backend lexical|transformer|precomputed] [--model-path DIR] [--npy FILE]
     [--codes CODE_FRAME.py] [--names NAMES.json] [--k K] [--months "August 2025,..."] [--model-in model.pkl]
     [--llm off|api|handoff] [--llm-scope all|detractor] [--llm-model-bulk M] [--llm-model-reason M] [--channel-families]
+    [--context BUSINESS_CONTEXT.json] [--reference REFERENCE.csv]
 
 Two-step use: run once (writes model.pkl); read topics.json and write NAMES.json ({topic id: theme name},
 same name = merged); run again with --model-in OUT/model.pkl --names NAMES.json for the named tables.
@@ -48,15 +49,78 @@ def read_pickle(path):
 def _csv(path, rows):
     if not rows:
         open(path, "w").close(); return
-    keys = list(rows[0].keys())
+    keys = []
+    for r in rows:
+        keys += [k for k in r if k not in keys]
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=keys); w.writeheader()
         for r in rows:
             w.writerow({k: (round(v, 4) if isinstance(v, float) else v) for k, v in r.items()})
 
 
+def _length_table(comments):
+    """Comment length (characters) by business and NPS group: Kobus reads long comments as a signal."""
+    rows = []
+    keys = sorted({(c["business"], c["group"]) for c in comments if c["group"]})
+    for b, g in keys:
+        L = np.array([len(c["text"]) for c in comments if c["business"] == b and c["group"] == g and not c["no_content"]])
+        if len(L):
+            rows.append({"business": b, "group": g, "n": len(L), "median_chars": float(np.median(L)),
+                         "p90_chars": float(np.percentile(L, 90)), "share_over_300_chars": float((L > 300).mean())})
+    return rows
+
+
+def _expectation_table(sc, exp, th):
+    """Where the expectation was set, share of detractor comments with a substantive code, by business."""
+    rows = []
+    for b in sorted({c["business"] for c in sc}):
+        idx = [i for i, c in enumerate(sc) if c["business"] == b and c["group"] == "detractor"
+               and th[i] - {"praise", "no_content", "other"}]
+        n = len(idx)
+        for src in sorted({exp.get(i, "unclear") for i in idx}):
+            k = sum(1 for i in idx if exp.get(i, "unclear") == src)
+            lo, hi = stats.wilson(k, n)
+            rows.append({"business": b, "expectation": src, "n_base": n, "n": k, "pct": 100 * k / n,
+                         "ci_low": 100 * lo, "ci_high": 100 * hi, "flag": stats.base_flag(n)})
+    return rows
+
+
+def _tier_table(comments, scope, th, book):
+    """Share of detractor comments carrying at least one code in each controllability tier, by business."""
+    tier = {b["id"]: b.get("tier") for b in book if b.get("tier")}
+    rows = []
+    for b in sorted({comments[i]["business"] for i in scope}):
+        idx = [j for j, i in enumerate(scope) if comments[i]["business"] == b and comments[i]["group"] == "detractor"]
+        n = len(idx)
+        for t in sorted(set(tier.values())):
+            k = sum(1 for j in idx if any(tier.get(c) == t for c in th[j]))
+            lo, hi = stats.wilson(k, n)
+            rows.append({"business": b, "tier": t, "n_base": n, "n": k, "pct": 100 * k / n if n else 0,
+                         "ci_low": 100 * lo, "ci_high": 100 * hi, "flag": stats.base_flag(n)})
+    return rows
+
+
+def _reference_check(comments, path, kw, cl, codes):
+    """Agreement with a hand-coded reference set: CSV with columns id and codes (codes separated by |)."""
+    from .frame_check import kappa
+    ref = {r["id"].strip(): {x.strip() for x in r["codes"].split("|") if x.strip()}
+           for r in csv.DictReader(open(path, encoding="utf-8-sig"))}
+    pos = {c["id"]: i for i, c in enumerate(comments)}
+    ids = [i for i in ref if i in pos]
+    rows = [{"code": "_matched_reference_comments", "n_reference": len(ref), "n_matched": len(ids)}]
+    for k in codes:
+        r = [k in ref[i] for i in ids]
+        for name, sets in (("keyword", kw), ("claude", cl)):
+            p = [k in sets[pos[i]] for i in ids]
+            tp = sum(a and b for a, b in zip(p, r))
+            rows.append({"code": k, "coder": name, "n_reference": sum(r), "n_coder": sum(p), "n_both": tp,
+                         "precision": round(tp / sum(p), 3) if sum(p) else "",
+                         "recall": round(tp / sum(r), 3) if sum(r) else "", "kappa": round(kappa(p, r), 3)})
+    return rows
+
+
 def run(data, out, backend="lexical", model_path=None, npy=None, codes=None, names=None, k=None, months=None,
-        model_in=None, llm_mode="off", llm_scope="all", llm_model_bulk=None, llm_model_reason=None, families=False):
+        model_in=None, llm_mode="off", llm_scope="all", llm_model_bulk=None, llm_model_reason=None, families=False, context=None, reference=None):
     t0 = time.time()
     warnings.filterwarnings("ignore", message="Number of distinct clusters")
     os.makedirs(out, exist_ok=True)
@@ -99,6 +163,7 @@ def run(data, out, backend="lexical", model_path=None, npy=None, codes=None, nam
     _csv(os.path.join(out, "prevalence_business.csv"), stats.prevalence(comments, themes, ("business",)))
     _csv(os.path.join(out, "prevalence_business_channel.csv"), stats.prevalence(comments, themes, ("business", "channel")))
     eff = stats.effects(comments, themes)
+    _csv(os.path.join(out, "comment_length.csv"), _length_table(comments))
     _csv(os.path.join(out, "effects_topics.csv"), eff)
     _csv(os.path.join(out, "lift_topics.csv"), stats.lift(comments, themes))
     if codes:
@@ -123,7 +188,9 @@ def run(data, out, backend="lexical", model_path=None, npy=None, codes=None, nam
             res["uncoded_topics"] = summ
         if claude:
             labels = frame_check.load_labels(codes)
-            book = llm.build_codebook(labels)
+            meta = frame_check.load_frame_meta(codes)
+            ctx = json.load(open(context)) if context else None
+            book = llm.build_codebook(labels, meta=meta)
             induced = None
             try:
                 ind, sample = llm.induce_codes(claude, [c["text"] for c in resid], book, model=mr)
@@ -137,12 +204,17 @@ def run(data, out, backend="lexical", model_path=None, npy=None, codes=None, nam
             except llm.NeedResponses as e:
                 llm_notes.append("New-code step pending: %s" % e)
             if induced is not None:
-                book = llm.build_codebook(labels, induced)
+                book = llm.build_codebook(labels, induced, meta=meta)
                 json.dump(book, open(os.path.join(out, "claude_codebook.json"), "w"), indent=1)
                 scope = [i for i, c in enumerate(comments) if not c["no_content"]
                          and (llm_scope == "all" or c["group"] == "detractor")]
                 try:
-                    th, other, unanswered = llm.code(claude, [comments[i] for i in scope], book, model=mb)
+                    exp = {}
+                    th, other, unanswered = llm.code(claude, [comments[i] for i in scope], book, model=mb,
+                                                     context=ctx, expectation=exp)
+                    _csv(os.path.join(out, "expectation_by_business.csv"),
+                         _expectation_table([comments[i] for i in scope], exp, th))
+                    _csv(os.path.join(out, "tier_by_business.csv"), _tier_table(comments, scope, th, book))
                     ls = [set() for _ in comments]
                     for j, i in enumerate(scope):
                         ls[i] = th[j] - {"no_content"}
@@ -151,6 +223,9 @@ def run(data, out, backend="lexical", model_path=None, npy=None, codes=None, nam
                     _csv(os.path.join(out, "prevalence_claude_codes.csv"), stats.prevalence(comments, ls, ("business",)))
                     _csv(os.path.join(out, "keyword_v_claude.csv"),
                          llm.agreement(comments, cs, ls, sorted(labels)))
+                    if reference:
+                        _csv(os.path.join(out, "reference_check.csv"),
+                             _reference_check(comments, reference, cs, ls, sorted(labels)))
                     oc = {}
                     for i, lab in other.items():
                         oc[lab] = oc.get(lab, 0) + 1
@@ -206,12 +281,15 @@ def main(argv=None):
     ap.add_argument("--llm", default="off", choices=["off", "api", "handoff"])
     ap.add_argument("--llm-scope", default="all", choices=["all", "detractor"])
     ap.add_argument("--llm-model-bulk"); ap.add_argument("--llm-model-reason")
+    ap.add_argument("--context", help="JSON {business: context text} for the Claude coding prompts")
+    ap.add_argument("--reference", help="hand-coded reference CSV (id, codes separated by |) to score coders")
     ap.add_argument("--channel-families", action="store_true",
                     help="collapse channel spellings to PHONE, EMAIL, WALK-IN, DIGITAL, OTHER")
     a = ap.parse_args(argv)
     run(a.data, a.out, a.backend, a.model_path, a.npy, a.codes, a.names, a.k,
         [m.strip() for m in a.months.split(",")] if a.months else None, a.model_in,
-        a.llm, a.llm_scope, a.llm_model_bulk, a.llm_model_reason, a.channel_families)
+        a.llm, a.llm_scope, a.llm_model_bulk, a.llm_model_reason, a.channel_families,
+        a.context, a.reference)
 
 
 if __name__ == "__main__":

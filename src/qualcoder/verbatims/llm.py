@@ -66,7 +66,14 @@ For each comment, return every code from the codebook that the comment clearly e
   single words or ratings with no reason, and "other" only for a substantive complaint or request that no
   code fits. When you use "other", give a 2 to 5 word English label for what it is about in "other_label".
 - Read Afrikaans and isiZulu in the original language and code them like English.
+- For each comment also say where the member's expectation was set, in "expectation": "service interaction"
+  when the complaint is about how this contact was handled; "product or benefit design" when it is about what
+  the option covers or pays; "joining or underwriting", "broker", "employer" or "scheme rules" when the
+  expectation came from there; "unclear" when the comment does not say, and for praise or no-content comments.
 Return one item per comment, using the comment's index."""
+
+EXPECTATION = ["service interaction", "product or benefit design", "joining or underwriting", "broker", "employer",
+               "scheme rules", "unclear"]
 
 NAME_SYSTEM = """You name themes found by clustering customer-survey comments from medical-scheme members.
 Each topic has its top words and the comments closest to its centre. Give each topic a short, specific
@@ -90,7 +97,8 @@ def _obj(props, required=None):
 def code_schema(code_ids):
     item = _obj({"i": {"type": "integer"},
                  "codes": {"type": "array", "items": {"type": "string", "enum": list(code_ids)}},
-                 "other_label": {"type": "string"}}, ["i", "codes", "other_label"])
+                 "other_label": {"type": "string"},
+                 "expectation": {"type": "string", "enum": EXPECTATION}}, ["i", "codes", "other_label", "expectation"])
     return _obj({"items": {"type": "array", "items": item}})
 
 
@@ -107,27 +115,33 @@ INDUCE_SCHEMA = _obj({
 })
 
 
-def build_codebook(labels=None, induced=None):
+def build_codebook(labels=None, induced=None, meta=None):
     """labels: {code_id: label or (label, definition)} from the keyword frame; induced: list of dicts from
-    induce_codes. Returns an ordered list of {"id", "label", "definition"}, with praise, other and
-    no_content appended."""
+    induce_codes; meta: {code_id: {"group", "tier"}} (frame_check.load_frame_meta). Returns an ordered list of
+    {"id", "label", "definition", "group", "tier"}, with praise, other and no_content appended."""
     book = []
+    meta = meta or {}
     for k, v in (labels or {}).items():
         lab, d = (v if isinstance(v, tuple) else (v, ""))
-        book.append({"id": k, "label": lab, "definition": d})
+        book.append({"id": k, "label": lab, "definition": d, "group": meta.get(k, {}).get("group", ""),
+                     "tier": meta.get(k, {}).get("tier", "")})
     for c in induced or []:
         if c["id"] not in {b["id"] for b in book}:
-            book.append({"id": c["id"], "label": c["label"], "definition": c.get("definition", "")})
+            book.append({"id": c["id"], "label": c["label"], "definition": c.get("definition", ""),
+                         "group": "induced", "tier": ""})
     for k, lab in (("praise", "Positive about the service or agent"),
                    ("other", "Substantive point no code fits"),
                    ("no_content", "No reason given")):
         if k not in {b["id"] for b in book}:
-            book.append({"id": k, "label": lab, "definition": ""})
+            book.append({"id": k, "label": lab, "definition": "", "group": "", "tier": ""})
     return book
 
 
 def _codebook_text(book):
-    return "\n".join("- %s: %s%s" % (b["id"], b["label"], (". " + b["definition"]) if b["definition"] else "")
+    def tag(b):
+        t = [x for x in (b.get("group"), b.get("tier")) if x]
+        return " [%s]" % "; ".join(t) if t else ""
+    return "\n".join("- %s%s: %s%s" % (b["id"], tag(b), b["label"], (". " + b["definition"]) if b.get("definition") else "")
                      for b in book)
 
 
@@ -144,18 +158,28 @@ def _req(custom_id, model, system, user, schema, effort):
         "output_config": {"effort": effort, "format": {"type": "json_schema", "schema": schema}}}}
 
 
-def coding_requests(comments, book, model=MODEL_BULK, batch=None):
-    """One request per `batch` comments. custom_id = code-<first index>; indices are positions in
-    `comments` so results map back without ids leaving the machine."""
+def coding_requests(comments, book, model=MODEL_BULK, batch=None, context=None):
+    """One request per `batch` comments of one business. custom_id = code-<first index>; indices are
+    positions in `comments` so results map back without ids leaving the machine. context: optional
+    {business: text} describing each business (products, joining routes, channels, current changes); it is
+    added to that business's system prompt."""
     batch = batch or BATCH
     ids = [b["id"] for b in book]
-    system = CODE_SYSTEM + "\n\nCodebook:\n" + _codebook_text(book)
+    base = CODE_SYSTEM + "\n\nCodebook (code [axis; who can act]: label):\n" + _codebook_text(book)
+    order = {}
+    for i, c in enumerate(comments):
+        order.setdefault(c.get("business", ""), []).append(i)
     reqs = []
-    for s in range(0, len(comments), batch):
-        chunk = comments[s:s + batch]
-        user = "Comments (index: text):\n" + "\n".join(
-            "%d: %s" % (s + j, redact(c["text"]).replace("\n", " ")) for j, c in enumerate(chunk))
-        reqs.append(_req("code-%d" % s, model, system, user, code_schema(ids), "low"))
+    for bus in sorted(order):
+        system = base
+        if context and context.get(bus):
+            system += "\n\nAll comments in this request are from members of %s. Context:\n%s" % (bus, context[bus])
+        idx = order[bus]
+        for s in range(0, len(idx), batch):
+            chunk = idx[s:s + batch]
+            user = "Comments (index: text):\n" + "\n".join(
+                "%d: %s" % (i, redact(comments[i]["text"]).replace("\n", " ")) for i in chunk)
+            reqs.append(_req("code-%d" % chunk[0], model, system, user, code_schema(ids), "low"))
     return reqs
 
 
@@ -264,9 +288,10 @@ class Claude:
 
 # ---------------------------------------------------------------- jobs
 
-def code(claude, comments, book, model=MODEL_BULK, job="code"):
-    """Returns (themes, other_labels): a set of code ids per comment, and the "other" labels by index."""
-    reqs = coding_requests(comments, book, model=model)
+def code(claude, comments, book, model=MODEL_BULK, job="code", context=None, expectation=None):
+    """Returns (themes, other_labels, unanswered): a set of code ids per comment, the "other" labels by index,
+    and the count of comments with no answer. Pass a dict as `expectation` to receive {index: source}."""
+    reqs = coding_requests(comments, book, model=model, context=context)
     res = claude.run(job, reqs)
     valid = {b["id"] for b in book}
     themes = [set() for _ in comments]
@@ -278,6 +303,8 @@ def code(claude, comments, book, model=MODEL_BULK, job="code"):
             if 0 <= i < len(comments):
                 themes[i] = {c for c in it["codes"] if c in valid}
                 seen.add(i)
+                if expectation is not None and it.get("expectation"):
+                    expectation[i] = it["expectation"]
                 if "other" in themes[i] and it.get("other_label"):
                     other[i] = it["other_label"].strip().lower()
     unanswered = len(comments) - len(seen)
